@@ -181,9 +181,19 @@ class PDF_Page {
 		$tanb = tan($thb);
 		$this->transform(1, $tana, $tanb, 1, 0, 0);
 	}
+}
 
-	function add() {
+class PDF_Object {
+	public $number;
+	public $datatype;
+	public $contents;
+	public $offset;
 
+	function __construct($number, $datatype, $contents) {
+		$this->number = $number;
+		$this->datatype = $datatype;
+		$this->contents = $contents;
+		$this->offset = 0;
 	}
 }
 
@@ -191,11 +201,143 @@ class PDF {
 	public $page = array(); //page descriptors
 	public $object = array(); //obj contents
 	public $xref_table_offset;
+	public $catalog;
+	public $procset;
+	public $pages;
 
-	function add($obj) {
-		$this->object.array_push($obj);
-		$temp = count($this->object);
-		$obj.number = $temp;
+	function add_obj($type, $contents) {
+		$obj = new PDF_Object(count($this->object), $type, $contents);
+		$this->object[] = $obj;
 		return $obj;
+	}
+
+	function get_ref($obj) {
+		return sprintf("%d 0 R", $obj->number);
+	}
+
+	function write_obj($fh, $obj) {
+		if ($obj instanceof PDF_Object && $obj->datatype == "stream") {
+			$this->write_indirect($fh, $obj);
+		} else {
+			$this->write_direct($fh, $obj);
+		}
+	}
+
+	function write_direct($fh, $obj) {
+		if (!($obj instanceof PDF_Object)) {
+			fwrite($fh, $obj . "\n");
+		} else if ($obj->datatype == "dictionary") {
+			fwrite($fh, "<<\n");
+			foreach ($obj->contents as $k => $v) :
+				fwrite($fh, sprintf("/%s ", $k));
+				$this->write_obj($fh, $v);
+			endforeach;
+			fwrite($fh, ">>\n");
+		} else if ($obj->datatype == "array") {
+			fwrite($fh, "[\n");
+			foreach ($obj->contents as $v) :
+				$this->write_obj($fh, $v);
+			endforeach;
+			fwrite($fh, "]\n");
+		} else if ($obj->datatype == "stream") {
+			$len = 0;
+			if (is_string($obj->contents)) {
+				$len = strlen($obj->contents);
+			} else {
+				foreach ($obj->contents as $str) :
+					$len +=	strlen($str) + 1;
+				endforeach;
+			}
+
+			fwrite($fh, sprintf("<< /Length %d >>\n", $len));
+			fwrite($fh, "stream\n");
+
+			if (is_string($obj->contents)) {
+				fwrite($fh, $obj->contents);
+			} else {
+				foreach ($obj->contents as $str) :
+					fwrite($fh, $str);
+					fwrite($fh, "\n");
+				endforeach;
+			}
+			fwrite($fh, "endstream\n");
+		}
+	}
+
+	function write_indirect($fh, $obj) {
+		$obj->offset = ftell($fh);
+		fwrite($fh, sprintf("%d %d obj\n", $obj->number, 0));
+		$this->write_direct($fh, $obj);
+		fwrite($fh, "endobj\n");
+	}
+
+	function write_header($fh) {
+		fwrite($fh, "%PDF-1.0\n");
+	}
+
+	function write_body($fh) {
+		foreach ($this->object as $value) :
+			$this->write_indirect($fh, $value);
+		endforeach;
+	}
+
+	function write_xref($fh) {
+		$this->xref_table_offset = ftell($fh);
+		fwrite($fh, "xref\n");
+		fwrite($fh, sprintf("%d %d\n", 1, count($this->object)));
+		foreach ($this->object as $value) :
+			fwrite($fh, sprintf("%010d %05d n \n", $value->offset, 0));
+		endforeach;
+	}
+
+	function write_trailer($fh) {
+		fwrite($fh, "trailer\n");
+		fwrite($fh, "<<\n");
+		fwrite($fh, sprintf("/Size %d\n", count($this->object)));
+		fwrite($fh, "/Root " . $this->get_ref($this->catalog) . "\n");
+		fwrite($fh, ">>\n");
+		fwrite($fh, "startxref\n");
+		fwrite($fh, sprintf("%d\n", $this->xref_table_offset));
+		fwrite($fh, "%%EOF\n");
+	}
+
+	function new_font($tab) {
+		$sub_type = $tab->subtype <> null ? $tab->subtype : "Type1";
+		$name = $tab->name <> null ? $tab->name : "Helvetica";
+		return $this->add_obj("dictionary", array("Type" => "/Font", "Subtype" => ("/" . $sub_type), "BaseFont" => ("/" . $name)));
+	}
+
+	function add_page() {
+		$page = new PDF_Page();
+		$contents = $this->add_obj("stream", $page->contents);
+		$resources = array("datatype" => "dictionary",
+							"contents" => array("Font" => array("datatype" => "dictionary", "contents" => array())),
+							"ProcSet" => $this->get_ref($this->procset));
+		foreach ($page->used_fonts as $i => $font) :
+			$resources["contents"]["Font"]["contents"]["F" . $i] = $this->get_ref($font);
+		endforeach;
+
+		$self = $this->add_obj("dictionary", array("Type" => "/Page",
+														"Parent" => $this->get_ref($this->pages),
+														"Contents" => $this->get_ref($contents),
+														"Resources" => $resources));
+		$this->pages["contents"]["Kids"]["contents"][] = $this->get_ref($self);
+		$this->pages["contents"]["Count"]++;
+	}
+
+	function write($name) {
+		$fh = fopen($name or "default.pdf", "w");
+
+		$this->write_header($fh);
+		$this->write_body($fh);
+		$this->write_xref($fh);
+		$this->write_trailer($fh);
+		fclose($fh);
+	}
+
+	function __construct() {
+		$this->pages = $this->add_obj("dictionary", array("Type" => "/Pages", "Kids" => array("datatype" => "array", "contents" => array()), "Count" => 0));
+		$this->catalog = $this->add_obj("dictionary", array("Type" => "/Catalog", "Pages" => $this->get_ref($this->pages)));
+		$this->procset = $this->add_obj("array", array("/PDF", "/Text"));
 	}
 }
